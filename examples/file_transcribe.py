@@ -55,6 +55,9 @@ async def demo_transcribe_stream(audio_data: bytes, config: ASRConfig):
                 print("[VAD] 检测到语音开始")
             case ResponseType.INTERIM_RESULT:
                 print(f"[中间] {response.text}")
+            case ResponseType.REVISED_RESULT:
+                # 二遍纠正（nonstream）结果：服务端对已识别内容的改写
+                print(f"[纠正] {response.text}")
             case ResponseType.FINAL_RESULT:
                 print(f"[最终] {response.text}")
             case ResponseType.SESSION_FINISHED:

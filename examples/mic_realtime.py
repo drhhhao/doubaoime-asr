@@ -76,8 +76,8 @@ async def main():
                 print()
             elif response.type == ResponseType.VAD_START:
                 print("[VAD] 检测到语音开始")
-            elif response.type == ResponseType.INTERIM_RESULT:
-                # 使用回车覆盖显示中间结果
+            elif response.type in (ResponseType.INTERIM_RESULT, ResponseType.REVISED_RESULT):
+                # 中间结果 / 二遍纠正结果，使用回车覆盖显示
                 print(f"\r[识别中] {response.text}", end="", flush=True)
             elif response.type == ResponseType.FINAL_RESULT:
                 # 清除中间结果并显示最终结果

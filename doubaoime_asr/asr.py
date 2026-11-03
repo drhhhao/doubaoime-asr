@@ -30,6 +30,8 @@ class ResponseType(Enum):
     SESSION_FINISHED = auto()
     VAD_START = auto()
     INTERIM_RESULT = auto()
+    REVISED_RESULT = auto()
+    """二遍纠正（nonstream）结果，已识别内容的改写，不一定是最终结果"""
     FINAL_RESULT = auto()
     HEARTBEAT = auto()
     ERROR = auto()
@@ -64,8 +66,10 @@ class _SessionState(BaseModel):
     """
     ASR 会话状态
     """
-    request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    # 官方 PC 客户端的 request_id 形如 ime_win_<uuid>
+    request_id: str = Field(default_factory=lambda: f"ime_win_{uuid.uuid4()}")
     final_text: str = ""
+    last_text: str = ""
     is_finished: bool = False
     error: Optional[ASRResponse] = None
 
@@ -75,12 +79,12 @@ class DoubaoASR:
     豆包输入法 ASR 客户端
     """
     def __init__(self, config: Optional[ASRConfig] = None):
-        self.config = config
+        self.config = config if config is not None else ASRConfig()
         self._encoder = AudioEncoder(self.config)
-    
+
     async def __aenter__(self) -> DoubaoASR:
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         pass
 
@@ -88,7 +92,7 @@ class DoubaoASR:
         """
         非流式语音识别
 
-        :param audio: 音频文件路径或 PCM 字节数据
+        :param audio: 音频文件路径或 PCM 音频数据
         :param on_interim: 可选的中间结果回调
         :return: 最终识别文本
         """
@@ -101,12 +105,12 @@ class DoubaoASR:
             elif response.type == ResponseType.ERROR:
                 raise ASRError(response.error_msg, response)
         return final_text
-    
+
     async def transcribe_stream(self, audio: Union[str, Path, bytes], *, realtime: bool = False) -> AsyncIterator[ASRResponse]:
         """
         流式语音识别（完整音频）
 
-        :param audio: 音频文件路径或 PCM 字节数据
+        :param audio: 音频文件路径或 PCM 音频数据
         :param realtime: 是否按实时速度发送
         :return: ASR 响应流，包括中间结果和最终结果
         """
@@ -117,7 +121,8 @@ class DoubaoASR:
         else:
             pcm_data = audio
 
-        opus_frames = self._encoder.pcm_to_opus_frames(pcm_data)
+        # 官方格式：每个包 40ms（2 个 20ms Opus 帧，code-3 复用）
+        opus_packets = self._encoder.pcm_to_opus_packets(pcm_data)
         state = _SessionState()
 
         try:
@@ -135,7 +140,7 @@ class DoubaoASR:
 
                 # 启动发送和接收任务
                 send_task = asyncio.create_task(
-                    self._send_audio(ws, opus_frames, state, realtime)
+                    self._send_audio(ws, opus_packets, state, realtime)
                 )
                 recv_task = asyncio.create_task(
                     self._receive_responses(ws, state, response_queue)
@@ -237,6 +242,24 @@ class DoubaoASR:
         except websockets.exceptions.WebSocketException as e:
             raise ASRError(f"WebSocket 错误: {e}") from e
 
+    def _next_frame_state(self, frame_index: int, is_last: bool = False) -> int:
+        """
+        计算第 frame_index 个音频包的 field 9 取值（从 0 开始计）
+
+        sequence 模式（官方行为）：恒为 frame_index + 1，没有单独的“最后一帧”标记，
+        结束只靠 FinishSession。
+        enum 模式（旧行为）：FIRST=1 / MIDDLE=3 / LAST=9。
+        """
+        if self.config.frame_state_mode == "enum":
+            if frame_index == 0 and is_last:
+                return FrameState.FRAME_STATE_FIRST
+            if frame_index == 0:
+                return FrameState.FRAME_STATE_FIRST
+            if is_last:
+                return FrameState.FRAME_STATE_LAST
+            return FrameState.FRAME_STATE_MIDDLE
+        return frame_index + 1
+
     async def _send_audio_realtime(
         self,
         ws: ClientConnection,
@@ -246,14 +269,10 @@ class DoubaoASR:
         """
         从异步迭代器读取 PCM 数据并实时发送
         """
-        timestamp_ms = int(time.time() * 1000)
         frame_index = 0
         pcm_buffer = b""
-
-        samples_per_frame = (
-            self.config.sample_rate * self.config.frame_duration_ms // 1000
-        )
-        bytes_per_frame = samples_per_frame * 2  # 16-bit
+        bytes_per_packet = self._encoder.bytes_per_packet
+        packet_interval = self.config.frame_duration_ms / 1000.0
 
         async for chunk in audio_source:
             if state.is_finished:
@@ -262,61 +281,40 @@ class DoubaoASR:
             pcm_buffer += chunk
 
             # 当缓冲区有足够数据时，编码并发送
-            while len(pcm_buffer) >= bytes_per_frame:
-                pcm_frame = pcm_buffer[:bytes_per_frame]
-                pcm_buffer = pcm_buffer[bytes_per_frame:]
+            while len(pcm_buffer) >= bytes_per_packet:
+                pcm_packet = pcm_buffer[:bytes_per_packet]
+                pcm_buffer = pcm_buffer[bytes_per_packet:]
 
-                # 编码为 Opus
-                opus_frame = self._encoder.encoder.encode(pcm_frame, samples_per_frame)
-
-                # 确定帧状态（实时模式下不知道最后一帧，使用 FIRST/MIDDLE）
-                if frame_index == 0:
-                    frame_state = FrameState.FRAME_STATE_FIRST
-                else:
-                    frame_state = FrameState.FRAME_STATE_MIDDLE
+                opus_packet = self._encoder.encode_packet(pcm_packet)
 
                 msg = _build_asr_request(
-                    opus_frame,
+                    opus_packet,
                     state.request_id,
-                    frame_state,
-                    timestamp_ms + frame_index * self.config.frame_duration_ms,
+                    self._next_frame_state(frame_index),
                 )
                 await ws.send(msg)
                 frame_index += 1
+                await asyncio.sleep(packet_interval)
 
-        # 迭代器结束，处理剩余数据
+        # 迭代器结束，处理剩余数据：不足一个包时重复最后一个完整包补齐（官方行为）
         if pcm_buffer and not state.is_finished:
-            # 补零到完整帧
-            if len(pcm_buffer) < bytes_per_frame:
-                pcm_buffer += b"\x00" * (bytes_per_frame - len(pcm_buffer))
+            last_packet = pcm_buffer
+            while len(last_packet) < bytes_per_packet:
+                last_packet += last_packet[: min(len(last_packet), bytes_per_packet - len(last_packet))]
 
-            opus_frame = self._encoder.encoder.encode(pcm_buffer, samples_per_frame)
-
+            opus_packet = self._encoder.encode_packet(last_packet)
             msg = _build_asr_request(
-                opus_frame,
+                opus_packet,
                 state.request_id,
-                FrameState.FRAME_STATE_LAST,
-                timestamp_ms + frame_index * self.config.frame_duration_ms,
+                self._next_frame_state(frame_index, is_last=True),
             )
             await ws.send(msg)
-        elif frame_index > 0 and not state.is_finished:
-            # 没有剩余数据，但需要发送一个 LAST 帧标记
-            # 发送一个空的 LAST 帧（静音）
-            silent_frame = b"\x00" * bytes_per_frame
-            opus_frame = self._encoder.encoder.encode(silent_frame, samples_per_frame)
-
-            msg = _build_asr_request(
-                opus_frame,
-                state.request_id,
-                FrameState.FRAME_STATE_LAST,
-                timestamp_ms + frame_index * self.config.frame_duration_ms,
-            )
-            await ws.send(msg)
+            frame_index += 1
 
         # FinishSession
         if not state.is_finished:
             await ws.send(_build_finish_session(state.request_id, self.config.get_token()))
-    
+
     async def _initialize_session(self, ws: ClientConnection, state: _SessionState) -> AsyncIterator[ASRResponse]:
         """
         初始化 ASR 会话
@@ -344,41 +342,34 @@ class DoubaoASR:
     async def _send_audio(
         self,
         ws: ClientConnection,
-        opus_frames: List[bytes],
+        opus_packets: List[bytes],
         state: _SessionState,
         realtime: bool,
     ):
         """
-        发送音频帧
+        发送音频包
         """
-        timestamp_ms = int(time.time() * 1000)
-        frame_interval = self.config.frame_duration_ms / 1000.0
+        packet_interval = self.config.frame_duration_ms / 1000.0
+        total = len(opus_packets)
 
-        for i, opus_frame in enumerate(opus_frames):
+        for i, opus_packet in enumerate(opus_packets):
             if state.is_finished:
                 break
 
-            if i == 0:
-                frame_state = FrameState.FRAME_STATE_FIRST
-            elif i == len(opus_frames) - 1:
-                frame_state = FrameState.FRAME_STATE_LAST
-            else:
-                frame_state = FrameState.FRAME_STATE_MIDDLE
-            
             msg = _build_asr_request(
-                opus_frame,
+                opus_packet,
                 state.request_id,
-                frame_state,
-                timestamp_ms + i * self.config.frame_duration_ms,
+                self._next_frame_state(i, is_last=(i == total - 1)),
             )
             await ws.send(msg)
 
             if realtime:
-                await asyncio.sleep(frame_interval)
-        
-        # FinishSession
-        await ws.send(_build_finish_session(state.request_id, self.config.get_token()))
-    
+                await asyncio.sleep(packet_interval)
+
+        # 结束只靠 FinishSession（官方没有“最后一帧”标记）
+        if not state.is_finished:
+            await ws.send(_build_finish_session(state.request_id, self.config.get_token()))
+
     async def _receive_responses(
         self,
         ws: ClientConnection,
@@ -393,6 +384,11 @@ class DoubaoASR:
                 response = await ws.recv()
                 resp = _parse_response(response)
 
+                # 维护最近一次有文本的结果，用于 SessionFinished 前没收到
+                # 明确 FINAL_RESULT 时的兜底
+                if resp.text:
+                    state.last_text = resp.text
+
                 if resp.type == ResponseType.ERROR:
                     state.error = resp
                     state.is_finished = True
@@ -403,6 +399,16 @@ class DoubaoASR:
                     await queue.put(resp)
                 elif resp.type == ResponseType.SESSION_FINISHED:
                     state.is_finished = True
+                    if not state.final_text and state.last_text:
+                        # 兜底：正常流程 results[0].is_interim=False 且
+                        # is_vad_finished=True 即为最终结果，但个别会话在
+                        # SessionFinished 前没有这样的包，用最近文本补一个
+                        await queue.put(ASRResponse(
+                            type=ResponseType.FINAL_RESULT,
+                            text=state.last_text,
+                            is_final=True,
+                            raw_json=resp.raw_json,
+                        ))
                     await queue.put(resp)
                     break
                 elif resp.type == ResponseType.FINAL_RESULT:
@@ -418,7 +424,6 @@ class DoubaoASR:
             await queue.put(None)
 
 
-    
 def _build_start_task(request_id: str, token: str) -> bytes:
     """构建 StartTask 消息 pb 数据"""
     request = AsrRequest()
@@ -453,11 +458,17 @@ def _build_finish_session(request_id: str, token: str) -> bytes:
 def _build_asr_request(
     audio_data: bytes,
     request_id: str,
-    frame_state: FrameState,
-    timestamp_ms: int,
+    frame_state: int,
+    timestamp_ms: Optional[int] = None,
 ) -> bytes:
+    """
+    构建 TaskRequest 消息 pb 数据
+
+    官方 payload 只有 {"timestamp_ms": <unix ms>}。
+    frame_state（field 9）官方发的是递增序号 1,2,3…N。
+    """
     request = AsrRequest()
-    metadata = json.dumps({"extra": {}, "timestamp_ms": timestamp_ms})
+    metadata = json.dumps({"timestamp_ms": timestamp_ms or int(time.time() * 1000)})
 
     request.service_name = "ASR"
     request.method_name = "TaskRequest"
@@ -466,7 +477,6 @@ def _build_asr_request(
     request.request_id = request_id
     request.frame_state = frame_state
     return request.SerializeToString()
-
 
 
 def _parse_response(data: bytes) -> ASRResponse:
@@ -516,28 +526,38 @@ def _parse_response(data: bytes) -> ASRResponse:
         return ASRResponse(type=ResponseType.VAD_START, vad_start=True, raw_json=json_data)
 
     # 解析识别结果
+    # results[0] 是到目前为止累积的全文；results[1..] 是分句
     text = ""
-    is_interim = True
-    vad_finished = False
-    nonstream_result = False
+    index0 = next((r for r in results if r.get("index", 0) == 0), results[0])
+    # 已经定稿的片段（is_interim=False）优先，否则用累积全文
+    finalized = [r for r in results if r.get("is_interim") is False and r.get("index", 0) != 0]
+    if finalized:
+        text = "".join(r.get("text", "") for r in finalized)
+    elif index0.get("text"):
+        text = index0["text"]
 
-    for r in results:
-        if r.get("text"):
-            text = r.get("text")
-        if r.get("is_interim") is False:
-            is_interim = False
-        if r.get("is_vad_finished"):
-            vad_finished = True
-        if r.get("extra", {}).get("nonstream_result"):
-            nonstream_result = True
+    is_interim = index0.get("is_interim", True)
+    vad_finished = bool(index0.get("is_vad_finished"))
+    nonstream_result = any(
+        r.get("extra", {}).get("nonstream_result") for r in results
+    )
 
-    # 最终结果
-    if nonstream_result or (not is_interim and vad_finished):
+    # 最终结果：results[0] 定稿且 VAD 结束
+    if is_interim is False and vad_finished:
         return ASRResponse(
             type=ResponseType.FINAL_RESULT,
             text=text,
             is_final=True,
-            vad_finished=vad_finished,
+            vad_finished=True,
+            raw_json=json_data,
+        )
+
+    # 二遍纠正（nonstream）结果：对已识别内容的改写，不是终态
+    if nonstream_result:
+        return ASRResponse(
+            type=ResponseType.REVISED_RESULT,
+            text=text,
+            is_final=False,
             raw_json=json_data,
         )
 
@@ -566,7 +586,7 @@ async def transcribe(
     便捷函数：非流式语音识别
 
     Args:
-        audio: 音频文件路径或 PCM 字节数据
+        audio: 音频文件路径或 PCM 音频数据
         config: ASR 配置（可选）
         on_interim: 中间结果回调（可选）
         realtime: 是否模拟实时语音输入
@@ -590,11 +610,9 @@ async def transcribe_stream(
     便捷函数：流式语音识别（完整音频）
 
     Args:
-        audio: 音频文件路径或 PCM 字节数据
+        audio: 音频文件路径或 PCM 音频数据
         config: ASR 配置（可选）
         realtime: 是否模拟实时语音输入
-            - True: 按音频实际时长发送，每帧间插入延迟，模拟实时的语音输入
-            - False（默认）: 尽快发送所有帧，会更快拿到结果（不知道会不会被风控）
 
     Yields:
         ASRResponse 对象

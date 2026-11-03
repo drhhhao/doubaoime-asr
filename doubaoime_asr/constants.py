@@ -10,6 +10,11 @@ WEBSOCKET_URL = "wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws"
 # 豆包输入法的 APP ID
 AID = 401734
 
+# 官方 PC 客户端（ImeService.exe）硬编码的 ASR appKey，
+# Android 1.5.3 的 dex 里也存在同一个值。
+# settings 接口下发的 key 有 concurrency quota = 5 的限制，所以默认用这个。
+DEFAULT_APP_KEY = "OrnqKvSSrs"
+
 # 应用配置 (豆包输入法)
 APP_CONFIG = {
     "aid": AID,
